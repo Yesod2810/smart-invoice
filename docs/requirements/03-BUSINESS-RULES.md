@@ -172,11 +172,19 @@ Inactive products must not be selectable for new invoice items unless an explici
 
 Existing invoices referencing inactive products must remain accessible.
 
+### BR-PRO-006 — No Physical Deletion
+
+Deleting a product through the API deactivates it.
+
+Products are never physically deleted through ordinary business workflows.
+
 ### BR-PRO-004 — Historical Price Preservation
 
 Changing a product price must not update the price stored in an issued invoice.
 
 Invoice items must store the applicable price at the time of issuance.
+
+Invoice items copy the product's price, tax rate, and descriptive fields into the item record. Whether an existing DRAFT is re-priced from the catalogue when the product changes, or keeps the values captured when the line was added, is an open decision (see 06-DAY-1-REVIEW.md, DEC-01). In either case the values are frozen at issuance.
 
 ### BR-PRO-005 — Product Snapshot
 
@@ -326,7 +334,7 @@ Tax must be calculated using the applicable tax configuration.
 
 The initial system must support item-level tax rates rather than assuming all products have the same rate.
 
-For an invoice-level discount, the discount must be allocated across taxable lines before tax calculation.
+For an invoice-level discount, the discount must be allocated across all invoice lines (including 0% tax lines) before tax calculation.
 
 The allocation policy must be deterministic.
 
@@ -387,6 +395,32 @@ The sum of item-level values must reconcile with invoice-level totals.
 If rounding produces a remainder during discount allocation, the system must allocate that remainder deterministically.
 
 The system must not silently discard financial differences.
+
+### BR-CAL-012 — Calculation Sequence
+
+The calculation service must apply the following fixed sequence. `round()` means rounding to the currency scale (0 for VND) with the rounding mode in BR-CAL-009.
+
+1. `line_amount = round(quantity × unit_price)`.
+2. `subtotal = Σ line_amount`.
+3. Allocate the invoice discount `D` across the lines in proportion to `line_amount`:
+   - `raw_i = D × line_amount_i / subtotal`.
+   - `allocated_i = floor(raw_i)` at currency scale.
+   - Distribute the remaining `D − Σ allocated_i` one currency unit at a time to lines ordered by largest fractional remainder, ties broken by ascending `line_number`.
+   - Result: `Σ allocated_i = D` exactly.
+4. `taxable_amount_i = line_amount_i − allocated_i`.
+5. `tax_amount_i = round(taxable_amount_i × tax_rate_i / 100)`.
+6. `line_total_i = taxable_amount_i + tax_amount_i`.
+7. Invoice `discount_amount = D`, `tax_amount = Σ tax_amount_i`, `grand_total = subtotal − D + tax_amount = Σ line_total_i`.
+
+Invoice-level tax must never be recomputed independently from the invoice-level taxable amount; it is always the sum of rounded line taxes.
+
+If `subtotal = 0`, the discount must be 0 (BR-CAL-004) and no allocation occurs.
+
+### BR-CAL-013 — Monetary Input Precision
+
+Monetary inputs (unit prices, discount amounts, payment amounts) must not have more decimal places than the currency scale (0 for VND). Requests that do must be rejected with HTTP 400 rather than silently rounded.
+
+Monetary values in API payloads must be parsed directly into BigDecimal.
 
 ### BR-CAL-011 — Example Calculation
 
@@ -455,6 +489,10 @@ Draft invoices may be modified by authorized users.
 
 The system must recalculate totals after relevant changes.
 
+A draft update must leave at least one item (consistent with US-06 AC-03).
+
+Only DRAFT invoices may be modified.
+
 ### BR-INV-011 — Issued Invoice Immutability
 
 Issued invoices must not allow direct modification of finalized financial information.
@@ -515,7 +553,12 @@ The implementation may use:
 
 Repeating the same successful issuance request must not produce a new invoice number.
 
-The backend must return the existing issued result or an appropriate conflict response according to the defined API contract.
+API contract:
+
+- A request that repeats a previously successful issuance with the same `Idempotency-Key` returns the stored original response.
+- Any other issuance request for an invoice that is not in DRAFT status returns HTTP 409 with error code `INVOICE_NOT_DRAFT`.
+
+The `Idempotency-Key` header is optional for issuance because the DRAFT → ISSUED transition itself cannot occur twice.
 
 ### BR-ISS-005 — Historical Snapshot
 
@@ -536,6 +579,8 @@ Invoice issuance and the related database changes must be committed atomically.
 
 External operations such as SMTP delivery must not occur inside the issuance database transaction.
 
+Issuance must lock the invoice row (`SELECT … FOR UPDATE`) before validating its DRAFT status, and must allocate the invoice number from `invoice_sequences` inside the same transaction so that a rollback does not consume a number.
+
 ---
 
 ## 10. Payment Management Rules
@@ -555,6 +600,8 @@ Negative or zero-value payments must be rejected.
 ### BR-PAY-003 — Outstanding Balance
 
 Outstanding Balance = Grand Total - Sum of Valid Payments
+
+A valid payment is a payment record with record status COMPLETED.
 
 The outstanding balance must not be negative.
 
@@ -596,15 +643,19 @@ An overpayment request must be rejected.
 
 ### BR-PAY-008 — Duplicate Payment Prevention
 
-Payment requests must support an idempotency key.
+Payment requests must include an `Idempotency-Key` header. A request without it is rejected with HTTP 400.
 
 Retrying the same request must not create duplicate payment records.
+
+Reusing a key with a different request payload must be rejected with HTTP 409 (`IDEMPOTENCY_KEY_REUSED`).
 
 ### BR-PAY-009 — Concurrent Payments
 
 Concurrent payment operations must not create an invalid outstanding balance.
 
-The backend must use appropriate locking or transactional controls.
+The backend must lock the invoice row (`SELECT … FOR UPDATE`) before reading the outstanding balance, then insert the payment and update the invoice payment summary in the same transaction.
+
+Database check constraints (`paid_amount <= grand_total`, `balance_due = grand_total - paid_amount`) act as the final safeguard.
 
 ### BR-PAY-010 — Payment Auditability
 
@@ -692,6 +743,13 @@ Email jobs must support the following statuses:
 - SENT
 - FAILED
 
+Status semantics:
+
+- PENDING — waiting to be processed. This includes jobs that failed with a retryable error and have attempts remaining; `next_attempt_at` is then set in the future.
+- PROCESSING — claimed by a worker until `locked_until`. A job whose lock has expired is eligible to be claimed again.
+- SENT — the provider accepted the message. This is a terminal status.
+- FAILED — a permanent error occurred or `max_attempts` was reached. This is a terminal status; a manual resend creates a new request.
+
 ### BR-EMAIL-005 — Retry Policy
 
 Failed email deliveries may be retried.
@@ -703,6 +761,8 @@ A suggested initial policy is three attempts with increasing retry delays.
 ### BR-EMAIL-006 — Duplicate Job Prevention
 
 The same idempotent delivery request must not create duplicate jobs.
+
+Manual send requests must include an `Idempotency-Key` header. System-generated jobs (for example, reminders) use a deterministic key such as `REMINDER:{invoiceId}:{reminderPeriod}`.
 
 ### BR-EMAIL-007 — Delivery Failure Independence
 
@@ -800,7 +860,7 @@ Business dates and scheduled operations must use the configured business timezon
 
 ### BR-AUDIT-001 — Important Operations
 
-The system must record important business events, including:
+The system must record important business events, including the following. Recording issuance and payment events is part of the MVP. The audit query API (US-13) is P1.
 
 - Invoice issuance.
 - Payment creation.
@@ -870,8 +930,9 @@ Conflicting operations must return HTTP 409 where appropriate.
 
 Examples:
 
-- Duplicate invoice issuance.
+- Duplicate invoice issuance (`INVOICE_NOT_DRAFT`).
 - Invalid invoice state transition.
+- Idempotency key reused with a different payload (`IDEMPOTENCY_KEY_REUSED`).
 - Duplicate SKU.
 - Concurrent modification.
 

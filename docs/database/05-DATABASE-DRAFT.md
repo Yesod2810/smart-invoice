@@ -292,7 +292,7 @@ Stores customer billing and contact information.
 | Column | Data Type | Constraint | Description |
 | --- | --- | --- | --- |
 | id | BIGINT | PK | Customer identifier |
-| customer_code | VARCHAR(50) | UNIQUE | Internal customer code |
+| customer_code | VARCHAR(50) | UNIQUE, NULLABLE | Optional internal customer code (not required by any user story) |
 | name | VARCHAR(200) | NOT NULL | Customer name |
 | email | VARCHAR(255) | NOT NULL | Email address |
 | phone | VARCHAR(30) | NULL | Phone number |
@@ -401,7 +401,7 @@ It stores the invoice header, lifecycle status, customer reference, finalized to
 | --- | --- | --- | --- |
 | id | BIGINT | PK | Invoice ID |
 | invoice_number | VARCHAR(50) | UNIQUE, NULLABLE | Official internal invoice number |
-| business_profile_id | BIGINT | FK | Issuing business |
+| business_profile_id | BIGINT | FK, NOT NULL | Issuing business |
 | customer_id | BIGINT | FK, NOT NULL | Customer reference |
 | created_by | BIGINT | FK, NOT NULL | Creator |
 | invoice_status | VARCHAR(30) | NOT NULL | DRAFT / ISSUED / CANCELLED |
@@ -413,7 +413,8 @@ It stores the invoice header, lifecycle status, customer reference, finalized to
 | grand_total | NUMERIC(19,4) | NOT NULL | Final amount |
 | paid_amount | NUMERIC(19,4) | NOT NULL DEFAULT 0 | Total valid payments |
 | balance_due | NUMERIC(19,4) | NOT NULL | Outstanding balance |
-| issued_at | TIMESTAMPTZ | NULL | Issuance timestamp |
+| issued_at | TIMESTAMPTZ | NULL | Issuance timestamp (UTC) |
+| issue_date | DATE | NULL | Issue date in the business timezone (printed on PDF, drives numbering year) |
 | due_date | DATE | NULL | Payment deadline |
 | notes | TEXT | NULL | Additional notes |
 | customer_snapshot | JSONB | NULL | Historical customer information |
@@ -431,8 +432,15 @@ It stores the invoice header, lifecycle status, customer reference, finalized to
 - Paid amount must be non-negative.
 - Balance due must be non-negative.
 - Paid amount must not exceed grand total.
+- Balance due must equal grand total minus paid amount: `CHECK (balance_due = grand_total - paid_amount)`.
+- Grand total must equal subtotal minus discount plus tax: `CHECK (grand_total = subtotal - discount_amount + tax_amount)`.
+- Discount must not exceed subtotal.
 - Invoice status must use supported values.
 - Payment status must use supported values.
+- An issued invoice must be complete: `CHECK (invoice_status <> 'ISSUED' OR (invoice_number IS NOT NULL AND issued_at IS NOT NULL AND issue_date IS NOT NULL AND customer_snapshot IS NOT NULL AND issuer_snapshot IS NOT NULL))`.
+- The due date must not be before the issue date: `CHECK (due_date IS NULL OR issue_date IS NULL OR due_date >= issue_date)`.
+
+For a DRAFT invoice, `paid_amount = 0`, `balance_due = grand_total`, and `payment_status = UNPAID`.
 
 ## 11.4 Draft Invoice Rules
 
@@ -494,7 +502,7 @@ Invoice items preserve the financial details used when the invoice is issued.
 | quantity | NUMERIC(19,4) | NOT NULL |
 | unit_price | NUMERIC(19,4) | NOT NULL |
 | line_amount | NUMERIC(19,4) | NOT NULL |
-| discount_amount | NUMERIC(19,4) | NOT NULL DEFAULT 0 |
+| discount_amount | NUMERIC(19,4) | NOT NULL DEFAULT 0 (allocated share of the invoice discount, BR-CAL-012) |
 | taxable_amount | NUMERIC(19,4) | NOT NULL |
 | tax_rate | NUMERIC(7,4) | NOT NULL |
 | tax_amount | NUMERIC(19,4) | NOT NULL |
@@ -508,7 +516,10 @@ Invoice items preserve the financial details used when the invoice is issued.
 - Discount must be non-negative.
 - Tax amount must be non-negative.
 - Line total must be non-negative.
-- Line number must be unique within each invoice.
+- Line number must be unique within each invoice: `UNIQUE (invoice_id, line_number)`.
+- `line_total = taxable_amount + tax_amount` and `taxable_amount = line_amount - discount_amount`.
+- Tax rate must be between 0 and 100.
+- `invoice_items.product_id` must use `ON DELETE` restrict or no action; products are deactivated, never deleted.
 
 ## 12.4 Historical Preservation
 
@@ -537,12 +548,14 @@ Stores payment transactions associated with issued invoices.
 | payment_method | VARCHAR(50) | NOT NULL |
 | payment_reference | VARCHAR(150) | NULL |
 | idempotency_key | VARCHAR(150) | UNIQUE, NOT NULL |
-| payment_status | VARCHAR(30) | NOT NULL |
+| status | VARCHAR(30) | NOT NULL DEFAULT 'COMPLETED' |
 | paid_at | TIMESTAMPTZ | NOT NULL |
 | recorded_by | BIGINT | FK, NOT NULL |
 | created_at | TIMESTAMPTZ | NOT NULL |
 
-## 13.3 Payment Status
+## 13.3 Payment Record Status
+
+The column is named `status` to avoid confusion with `invoices.payment_status`, which holds UNPAID, PARTIALLY_PAID, or PAID.
 
 The initial payment record supports:
 
@@ -557,8 +570,9 @@ The initial MVP primarily records completed payments.
 
 - Amount must be greater than zero.
 - Currency must match the invoice currency.
-- Idempotency key must be unique within its defined scope.
-- Payment must reference an issued invoice.
+- The idempotency key is globally unique in `payments`. This is a database backstop in addition to `idempotency_records`.
+- Payment must reference an issued invoice. The service enforces this under the invoice row lock.
+- Only COMPLETED payments count as valid payments in balance calculations.
 
 ## 13.5 Outstanding Balance
 
@@ -594,7 +608,7 @@ Email delivery must be independent from the invoice issuance transaction.
 | invoice_id | BIGINT | FK, NOT NULL |
 | recipient_email | VARCHAR(255) | NOT NULL |
 | subject | VARCHAR(255) | NOT NULL |
-| job_type | VARCHAR(50) | NOT NULL |
+| job_type | VARCHAR(50) | NOT NULL (INVOICE_DELIVERY, PAYMENT_REMINDER) |
 | status | VARCHAR(30) | NOT NULL |
 | attempt_count | INTEGER | NOT NULL DEFAULT 0 |
 | max_attempts | INTEGER | NOT NULL DEFAULT 3 |
@@ -624,7 +638,7 @@ Email delivery must be independent from the invoice issuance transaction.
 - A failed job must not invalidate the issued invoice.
 - Duplicate requests must not create duplicate jobs.
 
-PostgreSQL row locking may be used to coordinate multiple workers.
+Workers claim jobs with `SELECT … FOR UPDATE SKIP LOCKED` in a short transaction and set `locked_until`. A PROCESSING job whose `locked_until` has passed may be reclaimed. SMTP calls run outside any database transaction. Status semantics are defined in BR-EMAIL-004.
 
 ## 14.5 Delivery Semantics
 
@@ -706,6 +720,12 @@ Unique combination:
 
 business_profile_id + sequence_year
 
+`sequence_year` is the year of the invoice's `issue_date` in the business timezone (`business_profiles.timezone`).
+
+Allocation uses `UPDATE invoice_sequences SET last_value = last_value + 1 … RETURNING last_value` (or a `SELECT … FOR UPDATE` followed by an update) inside the issuance transaction. A missing year row is created with `INSERT … ON CONFLICT DO NOTHING` first.
+
+A PostgreSQL `SEQUENCE` must not be used, because its values are not rolled back and would leave gaps.
+
 ## 16.4 Invoice Number Format
 
 Example:
@@ -747,10 +767,15 @@ Prevents duplicate business operations caused by repeated API requests.
 | created_at | TIMESTAMPTZ | NOT NULL |
 | expires_at | TIMESTAMPTZ | NULL |
 
-## 17.3 Rules
+## 17.3 Constraints
+
+- `UNIQUE (operation_type, idempotency_key)`. The unique constraint, not an application-side check, is what prevents two concurrent requests with the same key from both executing.
+- `status` values: IN_PROGRESS, COMPLETED, FAILED.
+
+## 17.4 Rules
 
 - Repeated equivalent requests must not repeat the same financial operation.
-- Reusing a key with a different request payload must be rejected.
+- Reusing a key with a different request payload must be rejected with HTTP 409 `IDEMPOTENCY_KEY_REUSED`.
 - Concurrent requests with the same key must not both execute.
 - Successful results may be replayed according to the API contract.
 
@@ -869,6 +894,8 @@ The initial calculation policy uses:
 
 RoundingMode.HALF_UP
 
+Final monetary amounts for VND are stored rounded to scale 0, even though the columns allow scale 4. The allocation and rounding sequence is defined in BR-CAL-012.
+
 The policy must be centralized rather than implemented independently in multiple services.
 
 ## 21.4 Reconciliation
@@ -930,11 +957,12 @@ The following scenarios require concurrency protection.
 
 | Scenario | Protection |
 | --- | --- |
-| Two users issue one invoice | Transaction + locking |
+| Two users issue one invoice | `SELECT … FOR UPDATE` on invoice + DRAFT re-check |
 | Two invoices request sequence numbers | Atomic sequence allocation |
 | Same payment request is retried | Idempotency |
-| Two payments exceed remaining balance | Invoice locking |
-| Multiple workers claim one email job | Row-level locking |
+| Two payments exceed remaining balance | `SELECT … FOR UPDATE` on invoice + CHECK constraints |
+| Multiple workers claim one email job | `FOR UPDATE SKIP LOCKED` + `locked_until` |
+| Same idempotency key sent concurrently | Unique `(operation_type, idempotency_key)` |
 | Two users edit one draft | Optimistic locking |
 
 PostgreSQL locking and database constraints are the final consistency boundary.

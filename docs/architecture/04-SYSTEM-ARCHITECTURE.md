@@ -343,6 +343,13 @@ Expected components:
 - InvoiceRepository
 - InvoiceItemRepository
 
+The Invoice module exposes the following to other modules:
+
+- A read-only invoice query interface, used by the PDF and Email modules.
+- A payment-summary update method, used by the Payment module. It runs inside the payment transaction on the locked invoice row.
+
+Other modules must not write the `invoices` table directly.
+
 The Invoice module is the central business module of the application.
 
 It must not become a single large service containing all responsibilities.
@@ -382,6 +389,23 @@ Expected components:
 - InvoiceDocumentModel
 
 The PDF module must use invoice snapshots rather than current product or customer data.
+
+### 6.10 Module Dependency Rules
+
+Dependencies are allowed in one direction only:
+
+```text
+Common, Config  <-  every module
+Customer, Product  <-  Invoice
+Invoice  <-  Payment, PDF
+Invoice, PDF  <-  Email
+Invoice, Email  <-  Scheduler
+Audit  <-  Invoice, Payment, Customer, Product  (write-only event recording)
+```
+
+The Invoice module must not depend on the Email, PDF, or Payment modules.
+
+The `POST /invoices/{id}/send` endpoint is therefore handled by an Email-module controller or service that reads the invoice through the Invoice query interface.
 
 ## 6.7 Email Module
 
@@ -433,7 +457,7 @@ smart-invoice/
 │
 ├── src/
 │   ├── main/
-│   │   ├── java/com/smart-invoice/
+│   │   ├── java/com/smartinvoice/
 │   │   │
 │   │   │   ├── SmartInvoiceApplication.java
 │   │   │
@@ -537,12 +561,25 @@ Examples:
 | GET | /api/v1/customers | List customers |
 | POST | /api/v1/products | Create product |
 | GET | /api/v1/products | List products |
+| GET | /api/v1/customers/{id} | Retrieve customer |
+| PUT | /api/v1/customers/{id} | Update customer |
+| GET | /api/v1/products/{id} | Retrieve product |
+| PUT | /api/v1/products/{id} | Update product |
+| DELETE | /api/v1/products/{id} | Deactivate product |
 | POST | /api/v1/invoices | Create draft invoice |
+| GET | /api/v1/invoices | Search invoices |
 | GET | /api/v1/invoices/{id} | Retrieve invoice |
-| POST | /api/v1/invoices/{id}/issue | Issue invoice |
+| PUT | /api/v1/invoices/{id} | Update draft invoice |
+| POST | /api/v1/invoices/{id}/cancel | Cancel draft invoice |
+| POST | /api/v1/invoices/{id}/issue | Issue invoice (optional `Idempotency-Key`) |
 | GET | /api/v1/invoices/{id}/pdf | Generate PDF |
-| POST | /api/v1/invoices/{id}/send | Send invoice |
-| POST | /api/v1/invoices/{id}/payments | Record payment |
+| POST | /api/v1/invoices/{id}/send | Create email job (requires `Idempotency-Key`, returns 202) |
+| POST | /api/v1/invoices/{id}/payments | Record payment (requires `Idempotency-Key`) |
+| GET | /api/v1/invoices/{id}/payments | Payment history |
+
+Staff-account and business-profile administration endpoints are pending decision DEC-06 (see 06-DAY-1-REVIEW.md).
+
+Idempotency uses the `Idempotency-Key` request header. Keys are stored in `idempotency_records`, which is unique on `(operation_type, idempotency_key)`.
 
 ## 8.1 Request Validation
 
@@ -617,15 +654,18 @@ Flyway manages schema migrations.
 The initial database contains:
 
 - users
+- business_profiles
 - customers
 - products
 - invoices
 - invoice_items
 - payments
-- audit_logs
 - email_jobs
+- audit_logs
+- invoice_sequences
+- idempotency_records
 
-Additional tables may be introduced when justified by business requirements.
+05-DATABASE-DRAFT.md is the authoritative table list. Additional tables may be introduced when justified by business requirements.
 
 ## 9.2 Relationships
 
@@ -637,7 +677,10 @@ erDiagram
     PRODUCTS ||--o{ INVOICE_ITEMS : references
     INVOICES ||--o{ PAYMENTS : receives
     USERS ||--o{ AUDIT_LOGS : performs
+    USERS ||--o{ PAYMENTS : records
     INVOICES ||--o{ EMAIL_JOBS : triggers
+    BUSINESS_PROFILES ||--o{ INVOICES : issues
+    BUSINESS_PROFILES ||--o{ INVOICE_SEQUENCES : owns
 ```
 
 The detailed physical schema will be defined in 05-DATABASE-DRAFT.md and later implemented through Flyway migrations.
@@ -686,7 +729,9 @@ If any persistence operation fails, all related changes must be rolled back.
 
 ## 10.2 Invoice Issuance
 
-Invoice validation, number assignment, snapshot finalization, and lifecycle updates must occur within a controlled transaction.
+Invoice validation, number assignment, snapshot finalization, and lifecycle updates must occur within one transaction.
+
+The invoice row is locked (`SELECT … FOR UPDATE`) and its DRAFT status re-checked. The number is allocated from `invoice_sequences` by locking the sequence row in the same transaction, so that a rollback never consumes or skips a number.
 
 Duplicate issuance must be prevented.
 
@@ -695,6 +740,17 @@ Duplicate issuance must be prevented.
 Payment creation and outstanding-balance updates must be transactionally consistent.
 
 Concurrent requests must not result in overpayment.
+
+The payment transaction:
+
+1. Checks the idempotency record.
+2. Locks the invoice row with `SELECT … FOR UPDATE`.
+3. Validates the amount against `balance_due`.
+4. Inserts the payment.
+5. Updates `paid_amount`, `balance_due`, and `payment_status`.
+6. Commits.
+
+Pessimistic locking is the chosen mechanism for issuance and payment. The optimistic `version` column protects concurrent draft edits.
 
 ## 10.4 External Operations
 
@@ -748,13 +804,13 @@ A message broker is not required initially.
 ```mermaid
 sequenceDiagram
     actor Staff
-    participant API as InvoiceController
-    participant Service as InvoiceService
+    participant API as InvoiceEmailController
+    participant Service as InvoiceEmailService
     participant DB as PostgreSQL
     participant Worker as EmailJobProcessor
     participant SMTP as SMTP Provider
 
-    Staff->>API: Request invoice email
+    Staff->>API: Request invoice email (Idempotency-Key)
     API->>Service: Create email job
     Service->>DB: Persist PENDING job
     Service-->>API: Job accepted
@@ -768,12 +824,22 @@ sequenceDiagram
     Worker->>DB: Update job status
 ```
 
+Worker transaction boundaries:
+
+1. **Claim.** In a short transaction, select due jobs with `status = 'PENDING' AND next_attempt_at <= now()` (or `PROCESSING` with an expired `locked_until`) using `FOR UPDATE SKIP LOCKED`. Set them to PROCESSING, set `locked_until`, increment `attempt_count`, and commit.
+2. **Deliver.** Render the PDF and call SMTP with no database transaction open.
+3. **Record.** In a second short transaction, set the job to SENT, back to PENDING with a later `next_attempt_at`, or to FAILED.
+
+The polling worker (`EmailJobProcessor`, a Spring `@Scheduled` task) is part of the P0 email feature. It is separate from the P1 reminder scheduler.
+
 ## 12.2 Job Statuses
 
 - PENDING
 - PROCESSING
 - SENT
 - FAILED
+
+Status semantics are defined in BR-EMAIL-004.
 
 ## 12.3 Retry Mechanism
 

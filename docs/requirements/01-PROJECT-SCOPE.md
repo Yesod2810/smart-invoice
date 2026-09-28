@@ -5,7 +5,7 @@
 **Version:** 1.0  
 **Status:** Draft  
 **Date:** 28/09/2026  
-**Technology Stack:** Java, Spring Boot, PostgreSQL, Docker  
+**Technology Stack:** Java 21, Spring Boot, PostgreSQL, Docker  
 **Development Approach:** Agile — Incremental Development
 
 ---
@@ -206,7 +206,7 @@ These features will be implemented after the core invoice workflow is stable, su
 - Automatic overdue payment reminders.
 - Revenue summary reports.
 - Advanced invoice filtering.
-- Audit logging.
+- Audit logging (the `audit_logs` table and issuance/payment events are built with the MVP schema; the audit query API is P1 — see US-13).
 - Email notification templates.
 - Basic system monitoring.
 
@@ -275,7 +275,7 @@ The employee records payments against the invoice.
 
 The system updates the outstanding balance and payment status.
 
-The invoice reaches PAID status when its outstanding balance becomes zero.
+The invoice payment status becomes PAID when its outstanding balance becomes zero. The invoice lifecycle status remains ISSUED (lifecycle and payment status are tracked separately — see 03-BUSINESS-RULES.md §8).
 
 ## 7. Non-Functional Requirements
 
