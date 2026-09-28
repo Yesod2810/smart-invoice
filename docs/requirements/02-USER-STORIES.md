@@ -301,7 +301,7 @@ PUT /api/v1/products/{id}
 
 DELETE /api/v1/products/{id}
 
-Deletion may be implemented as soft deletion to preserve historical references.
+DELETE deactivates the product (`is_active = false`); products are never physically deleted through the API (BR-PRO-003, BR-PRO-006).
 
 ---
 
@@ -460,6 +460,9 @@ Given a valid DRAFT invoice, when issuance is confirmed, then the system assigns
 
 Given an invoice has already been issued, when the issuance request is repeated, then no additional invoice number is generated.
 
+- A retry carrying the same `Idempotency-Key` replays the original successful response.
+- Any other issuance request for an invoice that is no longer DRAFT returns HTTP 409 (`INVOICE_NOT_DRAFT`). See BR-ISS-004.
+
 ##### AC-03 — Invalid invoice
 
 Given an invoice contains invalid financial information, when issuance is attempted, then the request is rejected.
@@ -512,6 +515,12 @@ As a Staff member, I want to search and view invoices so that I can retrieve his
 GET /api/v1/invoices
 
 GET /api/v1/invoices/{id}
+
+Draft maintenance (BR-INV-010, BR-INV-012):
+
+PUT /api/v1/invoices/{id} — replace a DRAFT's items, discount, due date, and notes; totals are recalculated server-side; at least one item must remain.
+
+POST /api/v1/invoices/{id}/cancel — DRAFT → CANCELLED only.
 
 ---
 
@@ -606,7 +615,7 @@ Given the same delivery request is retried with the same idempotency key, then n
 
 #### Expected API
 
-POST /api/v1/invoices/{id}/send
+POST /api/v1/invoices/{id}/send (requires `Idempotency-Key` header; returns HTTP 202 Accepted)
 
 #### Business Rules
 
@@ -660,15 +669,19 @@ Given payments exist for an invoice, when payment history is requested, then all
 
 Outstanding Balance = Invoice Total - Sum of Valid Payments
 
+A "valid payment" is a payment record whose record status is COMPLETED (BR-PAY-003).
+
 - Payments must be associated with an existing invoice.
 - Payment operations must be transactional.
 - Concurrent payments must not produce an invalid outstanding balance.
 - Payment records must remain auditable.
 - Invoice lifecycle status and payment status must be tracked separately.
 
-#### Expected API
+#### Expected APIs
 
-POST /api/v1/invoices/{id}/payments
+POST /api/v1/invoices/{id}/payments (requires `Idempotency-Key` header)
+
+GET /api/v1/invoices/{id}/payments
 
 ---
 
